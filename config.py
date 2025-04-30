@@ -3,8 +3,8 @@ from pathlib import Path
 def get_config():
     return {
         "batch_size": 16,
-        "num_epochs": 2,
-        "lr": 10**-4,
+        "num_epochs": 40,
+        "lr": 3e-4,
         "seq_len": 160,
         "d_model": 512,
         "datasource": 'iwslt2017',
@@ -16,7 +16,8 @@ def get_config():
         "tokenizer_file": "tokenizer_{0}.json",
         "experiment_name": "runs/tmodel",
         "dataset_config": "iwslt2017-zh-en",
-        "trust_remote_code": True
+        "trust_remote_code": True,
+        "beam_size": 5
     }
 
 def get_weights_file_path(config, epoch: str):

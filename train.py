@@ -53,8 +53,82 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
 
     return decoder_input.squeeze(0)
 
+def beam_search_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device, beam_size=5):
+    """
+    Beam Search解码实现
+    Args:
+        model: Transformer模型
+        source: 输入序列张量
+        source_mask: 输入序列掩码
+        tokenizer_src: 源语言tokenizer
+        tokenizer_tgt: 目标语言tokenizer
+        max_len: 最大生成长度
+        device: 计算设备
+        beam_size: beam search的宽度
+    Returns:
+        最佳翻译序列
+    """
+    sos_idx = tokenizer_tgt.token_to_id('[SOS]')
+    eos_idx = tokenizer_tgt.token_to_id('[EOS]')
+    
+    # 预计算编码器输出，并对所有候选复用
+    encoder_output = model.encode(source, source_mask)  # (1, seq_len, d_model)
+    
+    # 候选序列：(分数, 序列, 是否完成)
+    # 初始候选仅包含开始符号[SOS]
+    candidates = [(0.0, [sos_idx], False)]
+    
+    for _ in range(max_len):
+        # 遍历当前所有候选序列
+        candidates_new = []
+        
+        # 对每个候选序列进行扩展
+        for score, seq, is_finished in candidates:
+            # 如果序列已经完成（遇到EOS或达到最大长度），保留不变
+            if is_finished:
+                candidates_new.append((score, seq, is_finished))
+                continue
+            
+            # 将候选序列转为张量，准备输入解码器
+            decoder_input = torch.tensor([seq], dtype=torch.long, device=device)  # (1, current_len)
+            
+            # 构建解码器掩码
+            decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
+            
+            # 计算解码器输出
+            out = model.decode(encoder_output, source_mask, decoder_input, decoder_mask)
+            # 获取最后一个位置的预测
+            prob = model.project(out[:, -1])  # (1, vocab_size)
+            
+            # 获取topk个最有可能的下一个词
+            log_probs, next_words = torch.topk(torch.log_softmax(prob, dim=-1), beam_size)
+            
+            # 扩展每个候选词
+            for i in range(beam_size):
+                word = next_words[0, i].item()
+                log_prob = log_probs[0, i].item()
+                
+                # 计算新的得分：之前的得分加上新词的对数概率
+                new_score = score + log_prob
+                new_seq = seq + [word]
+                
+                # 检查是否完成
+                new_is_finished = (word == eos_idx)
+                
+                candidates_new.append((new_score, new_seq, new_is_finished))
+        
+        # 保留最好的beam_size个候选
+        candidates = sorted(candidates_new, key=lambda x: x[0], reverse=True)[:beam_size]
+        
+        # 如果所有候选都已完成，提前结束
+        if all(is_finished for _, _, is_finished in candidates):
+            break
+    
+    # 返回得分最高的序列
+    best_score, best_seq, _ = candidates[0]
+    return torch.tensor(best_seq, dtype=torch.long, device=device)
 
-def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer, num_examples=2):
+def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer, config, num_examples=2):
     model.eval()
     count = 0
 
@@ -81,7 +155,8 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
             assert encoder_input.size(
                 0) == 1, "Batch size must be 1 for validation"
 
-            model_out = greedy_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, max_len, device)
+            # decode method
+            model_out = beam_search_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, max_len, device, beam_size=config.get('beam_size', 5))
 
             source_text = batch["src_text"][0]
             target_text = batch["tgt_text"][0]
@@ -101,7 +176,13 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
                 print_msg('-'*console_width)
                 break
     
+    # initialize evaluation metrics variables
     bleu = None
+    char_bleu = None
+    word_bleu = None
+    cer = None
+    wer = None
+    
     if writer:
         # Evaluate the character error rate
         # Compute the char error rate 
@@ -116,13 +197,38 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
         writer.add_scalar('validation wer', wer, global_step)
         writer.flush()
 
-        # Compute the BLEU metric
-        metric = torchmetrics.BLEUScore()
-        bleu = metric(predicted, expected)
-        writer.add_scalar('validation BLEU', bleu, global_step)
+        # check if the source language is Chinese
+        is_chinese = config['lang_src'] == 'zh' or config['lang_tgt'] == 'zh'
+        
+        # for Chinese, we calculate character-level BLEU and word-level BLEU
+        if is_chinese:
+            # 1. character-level BLEU (split text into individual characters)
+            char_predicted = [' '.join(list(text)) for text in predicted]
+            char_expected = [' '.join(list(text)) for text in expected]
+            
+            # character-level BLEU calculation
+            char_metric = torchmetrics.BLEUScore(n_gram=4)
+            char_bleu = char_metric(char_predicted, char_expected)
+            writer.add_scalar('validation char_BLEU', char_bleu, global_step)
+            
+            # 2. use standard BLEU score 
+            metric = torchmetrics.BLEUScore()
+            word_bleu = metric(predicted, expected)
+            writer.add_scalar('validation word_BLEU', word_bleu, global_step)
+            
+            # use character-level BLEU as the main metric
+            bleu = char_bleu
+        else:
+            # non-Chinese language uses standard BLEU
+            metric = torchmetrics.BLEUScore()
+            bleu = metric(predicted, expected)
+            word_bleu = bleu  # non-Chinese情况下，word_bleu就是标准BLEU
+            writer.add_scalar('validation BLEU', bleu, global_step)
+        
         writer.flush()
     
-    return bleu, source_texts, expected, predicted
+    # return all evaluation metrics
+    return bleu, source_texts, expected, predicted, char_bleu, word_bleu, cer, wer
 
 def get_all_sentences(ds, lang):
     for item in ds:
@@ -134,18 +240,18 @@ def get_or_build_tokenizer(config, ds, lang):
         # Most code taken from: https://huggingface.co/docs/tokenizers/quicktour
         tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
         
-        # 针对中文的分词处理
+        # 针对中文的分词处理    
         if lang == "zh":
-            # 中文字符级别分词，不使用空格分词
+            # Chinese character-level tokenization, do not use space tokenization
             from tokenizers.pre_tokenizers import Metaspace
-            # 尝试使用兼容不同版本的方式创建Metaspace
+            # try to use a compatible way to create Metaspace
             try:
                 tokenizer.pre_tokenizer = Metaspace(replacement="▁", add_prefix_space=True)
             except TypeError:
-                # 如果上面的调用失败，尝试不带add_prefix_space参数
+                # if the above call fails, try without the add_prefix_space parameter
                 tokenizer.pre_tokenizer = Metaspace(replacement="▁")
         else:
-            # 其他语言使用空格分词
+            # other languages use space tokenization
             tokenizer.pre_tokenizer = Whitespace()
             
         trainer = WordLevelTrainer(special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"], min_frequency=2)
@@ -159,12 +265,12 @@ def get_ds(config):
     # It only has the train split, so we divide it overselves
     ds_raw = load_dataset(
         f"{config['datasource']}", 
-        config.get('dataset_config', None),  # 使用新的dataset_config参数
+        config.get('dataset_config', None),  # use the new dataset_config parameter
         split='train',
-        trust_remote_code=config['trust_remote_code']  # 直接访问trust_remote_code参数
+        trust_remote_code=config['trust_remote_code']  #    directly access the trust_remote_code parameter
     )
     
-    # 根据配置确定实际的源语言和目标语言
+    # determine the actual source and target languages
     src_lang = config['lang_src'] 
     tgt_lang = config['lang_tgt']
 
@@ -177,7 +283,7 @@ def get_ds(config):
     val_ds_size = len(ds_raw) - train_ds_size
     train_ds_raw, val_ds_raw = random_split(ds_raw, [train_ds_size, val_ds_size])
 
-    # 创建数据集
+    # create datasets
     train_ds = BilingualDataset(train_ds_raw, tokenizer_src, tokenizer_tgt, src_lang, tgt_lang, config['seq_len'])
     val_ds = BilingualDataset(val_ds_raw, tokenizer_src, tokenizer_tgt, src_lang, tgt_lang, config['seq_len'])
 
@@ -225,7 +331,7 @@ def train_model(config):
     train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
     model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(device)
     # Tensorboard
-    writer = SummaryWriter(config['experiment_name']) #定义了日志的存储位置。
+    writer = SummaryWriter(config['experiment_name']) #define the location of the log.
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'], eps=1e-9)
 
@@ -284,7 +390,7 @@ def train_model(config):
 
         # Run validation at the end of every epoch
         print(f"\n▶ Validation after epoch {epoch}")
-        bleu_score, source_texts, target_texts, predicted_texts = run_validation(
+        bleu_score, source_texts, target_texts, predicted_texts, char_bleu, word_bleu, cer, wer = run_validation(
             model, 
             val_dataloader,
             tokenizer_src,
@@ -294,30 +400,50 @@ def train_model(config):
             lambda msg: print(msg),
             global_step,
             writer,
+            config,
             num_examples=2
         )
         
-        # 打印BLEU评分
+        # print BLEU score
         if bleu_score is not None:
             print(f"BLEU score: {bleu_score:.4f}")
-            # 记录这个epoch的BLEU到日志
-            with open(f"{config['datasource']}_{config['model_folder']}/bleu_log.txt", "a") as f:
-                f.write(f"Epoch {epoch}, BLEU: {bleu_score:.4f}\n")
+            # save detailed evaluation results to a separate file
+            # if the directory does not exist, create it
+            detailed_eval_dir = Path(f"{config['datasource']}_{config['model_folder']}/detailed_evaluation")
+            detailed_eval_dir.mkdir(parents=True, exist_ok=True)
             
-            # 将详细的评估结果保存到单独的文件
-            detailed_eval_path = Path(f"{config['datasource']}_{config['model_folder']}/detailed_evaluation")
-            detailed_eval_path.mkdir(exist_ok=True)
-            
-            with open(f"{detailed_eval_path}/epoch_{epoch:02d}_evaluation.txt", "w", encoding="utf-8") as f:
-                f.write(f"=== Evaluation Results for Epoch {epoch} ===\n\n")
-                f.write(f"BLEU Score: {bleu_score:.4f}\n\n")
-                
+            # save detailed evaluation results to a separate file
+            detailed_eval_path = detailed_eval_dir / f"detailed_eval_epoch_{epoch}.txt"
+            with open(detailed_eval_path, "w", encoding="utf-8") as f:
                 for i, (src, tgt, pred) in enumerate(zip(source_texts, target_texts, predicted_texts)):
                     f.write(f"Example {i+1}:\n")
-                    f.write(f"SOURCE: {src}\n")
-                    f.write(f"TARGET: {tgt}\n")
-                    f.write(f"PREDICTED: {pred}\n")
-                    f.write("-" * 80 + "\n\n")
+                    f.write(f"Source: {src}\n")
+                    f.write(f"Target: {tgt}\n")
+                    f.write(f"Predicted: {pred}\n")
+                    f.write("\n")
+                
+                # add evaluation metrics information - ensure all metrics are defined
+                if cer is not None:
+                    f.write(f"Character Error Rate: {cer:.4f}\n")
+                if wer is not None:
+                    f.write(f"Word Error Rate: {wer:.4f}\n")
+                
+                # if the source or target language is Chinese, add character-level and word-level BLEU
+                if config['lang_src'] == 'zh' or config['lang_tgt'] == 'zh':
+                    if char_bleu is not None:
+                        f.write(f"Character-level BLEU: {char_bleu:.4f}\n")
+                    if word_bleu is not None:
+                        f.write(f"Word-level BLEU: {word_bleu:.4f}\n")
+                    f.write(f"Main BLEU (Character-level): {bleu_score:.4f}\n")
+                else:
+                    f.write(f"BLEU Score: {bleu_score:.4f}\n")
+            
+            # record BLEU score to log file
+            with open(f"{config['datasource']}_{config['model_folder']}/bleu_log.txt", "a", encoding="utf-8") as f:
+                if config['lang_src'] == 'zh' or config['lang_tgt'] == 'zh' and char_bleu is not None and word_bleu is not None:
+                    f.write(f"Epoch: {epoch}, Char-BLEU: {char_bleu:.4f}, Word-BLEU: {word_bleu:.4f}\n")
+                else:
+                    f.write(f"Epoch: {epoch}, BLEU: {bleu_score:.4f}\n")
     
         # Save the model at the end of every epoch
         model_filename = get_weights_file_path(config, f"{epoch:02d}")

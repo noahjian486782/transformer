@@ -2,6 +2,5 @@
 __pycache__/
 # PyTorch Lightning & TensorBoard logs
 runs/
-logs/
 
 *.pt
