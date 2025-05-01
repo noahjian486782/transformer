@@ -335,6 +335,19 @@ def train_model(config):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'], eps=1e-9)
 
+    # 添加warmup学习率调度器
+    warmup_steps = config.get('warmup_steps', 4000)  # 默认使用4000步
+
+    def lr_schedule(step):
+        # 实现预热学习率调度：在warmup_steps内线性增加，之后按step的平方根反比例衰减
+        if step == 0:
+            return 1e-8  # 避免初始为0
+        if step < warmup_steps:
+            return step / warmup_steps
+        return (warmup_steps ** 0.5) / (step ** 0.5)  # 先增加后衰减
+    
+    scheduler = LambdaLR(optimizer, lr_lambda=lr_schedule)
+
     # If the user specified a model to preload before training, load it
     initial_epoch = 0
     global_step = 0
@@ -347,6 +360,11 @@ def train_model(config):
         initial_epoch = state['epoch'] + 1
         optimizer.load_state_dict(state['optimizer_state_dict'])
         global_step = state['global_step']
+        
+        # 恢复调度器状态，如果存在的话
+        if 'scheduler_state_dict' in state:
+            scheduler.load_state_dict(state['scheduler_state_dict'])
+            print('Scheduler state restored')
     else:
         print('No model to preload, starting from scratch')
 
@@ -385,6 +403,11 @@ def train_model(config):
             # Update the weights
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+
+            # 更新学习率
+            scheduler.step()
+            # 记录学习率
+            writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], global_step)
 
             global_step += 1
 
@@ -451,7 +474,8 @@ def train_model(config):
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'global_step': global_step
+            'global_step': global_step,
+            'scheduler_state_dict': scheduler.state_dict()  # 保存调度器状态
         }, model_filename)
 
 
