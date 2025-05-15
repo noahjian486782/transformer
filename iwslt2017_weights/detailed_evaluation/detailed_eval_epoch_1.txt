@@ -1,0 +1,16 @@
+Example 1:
+Source: 这是你的基因图谱的样子，这是你的一条染色体
+Target: This is what you look like. This is one of your chromosomes.
+Predicted: It ' s a .
+
+Example 2:
+Source: 像种子一样它们拥有干燥耐受性
+Target: Like seeds, these are desiccation-tolerant.
+Predicted: It ' s a .
+
+Character Error Rate: 0.8641
+Word Error Rate: 1.0000
+NLTK BLEU (jieba tokenized): 0.0000
+Character-level BLEU: 0.0000
+Word-level BLEU: 0.0000
+Main BLEU (NLTK): 0.0000

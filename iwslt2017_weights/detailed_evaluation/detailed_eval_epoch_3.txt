@@ -1,0 +1,16 @@
+Example 1:
+Source: 储备资源是反叛的目的
+Target: And the reserve was a target to the rebels.
+Predicted: I ' m going to show you a couple of examples .
+
+Example 2:
+Source: 当我在第二年TED会议遇见哈里特的时候， 她在线订购了我们自己快乐的单模标本T恤衫。
+Target: And when I met Harriet in person the next year at the TED Conference, she'd gone online and ordered our own happy Haplotype T-shirts.
+Predicted: And I ' m going to tell you a little bit about the .
+
+Character Error Rate: 0.7898
+Word Error Rate: 1.0000
+NLTK BLEU (jieba tokenized): 0.0147
+Character-level BLEU: 0.0000
+Word-level BLEU: 0.0000
+Main BLEU (NLTK): 0.0147

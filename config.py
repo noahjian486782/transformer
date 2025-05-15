@@ -2,8 +2,8 @@ from pathlib import Path
 
 def get_config():
     return {
-        "batch_size": 16,
-        "num_epochs": 40,
+        "batch_size": 8,
+        "num_epochs": 20,
         "lr": 3e-4,
         "seq_len": 160,
         "d_model": 512,
@@ -17,7 +17,9 @@ def get_config():
         "experiment_name": "runs/tmodel",
         "dataset_config": "iwslt2017-zh-en",
         "trust_remote_code": True,
-        "beam_size": 5
+        "beam_size": 3,
+        "warmup_steps": 4000,
+        "gradient_accumulation_steps": 2
     }
 
 def get_weights_file_path(config, epoch: str):

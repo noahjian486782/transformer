@@ -1,0 +1,16 @@
+Example 1:
+Source: 犹豫一些原因 我想现在 稍微暂停一下 我的演讲
+Target: For some reason, I thought it would be a good idea to put an intermission in my talk.
+Predicted: And then the of the , the , the , the , the , the , the , the .
+
+Example 2:
+Source: 这是前所未有的。
+Target: This has never been seen before.
+Predicted: .
+
+Character Error Rate: 0.8120
+Word Error Rate: 1.0833
+NLTK BLEU (jieba tokenized): 0.0000
+Character-level BLEU: 0.0000
+Word-level BLEU: 0.0000
+Main BLEU (NLTK): 0.0000
