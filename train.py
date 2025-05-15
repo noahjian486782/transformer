@@ -22,6 +22,10 @@ from tokenizers.pre_tokenizers import Whitespace
 
 import torchmetrics
 from torch.utils.tensorboard import SummaryWriter
+import jieba
+import nltk
+import re
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
 def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
     sos_idx = tokenizer_tgt.token_to_id('[SOS]')
@@ -182,6 +186,7 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
     word_bleu = None
     cer = None
     wer = None
+    nltk_bleu = None  # 新增NLTK的BLEU评分
     
     if writer:
         # Evaluate the character error rate
@@ -197,11 +202,45 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
         writer.add_scalar('validation wer', wer, global_step)
         writer.flush()
 
+        # 使用NLTK计算BLEU分数
+        smooth = SmoothingFunction()
+        nltk_bleu_scores = []
+        
         # check if the source language is Chinese
         is_chinese = config['lang_src'] == 'zh' or config['lang_tgt'] == 'zh'
         
-        # for Chinese, we calculate character-level BLEU and word-level BLEU
+        # 中文分词和BLEU计算
         if is_chinese:
+            # 1. 使用jieba分词处理中文
+            tokenized_pred = []
+            tokenized_exp = []
+            
+            for p, e in zip(predicted, expected):
+                # 对中文进行分词
+                if config['lang_tgt'] == 'zh':
+                    # 如果目标语言是中文，对预测和期望结果进行分词
+                    tokenized_pred.append(list(jieba.cut(p.strip())))
+                    tokenized_exp.append([list(jieba.cut(e.strip()))])
+                else:
+                    # 如果源语言是中文，但目标语言是英文
+                    tokenized_pred.append(p.strip().split())
+                    tokenized_exp.append([e.strip().split()])
+            
+            # 2. 计算NLTK BLEU得分
+            for p, e in zip(tokenized_pred, tokenized_exp):
+                try:
+                    # 使用NLTK计算BLEU得分，包括平滑处理
+                    score = sentence_bleu(e, p, smoothing_function=smooth.method1)
+                    nltk_bleu_scores.append(score)
+                except Exception as ex:
+                    print(f"Error calculating BLEU: {ex}")
+            
+            # 计算平均BLEU得分
+            if nltk_bleu_scores:
+                nltk_bleu = sum(nltk_bleu_scores) / len(nltk_bleu_scores)
+                writer.add_scalar('validation nltk_BLEU', nltk_bleu, global_step)
+            
+            # 继续计算原有的char_bleu和word_bleu
             # 1. character-level BLEU (split text into individual characters)
             char_predicted = [' '.join(list(text)) for text in predicted]
             char_expected = [' '.join(list(text)) for text in expected]
@@ -216,8 +255,8 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
             word_bleu = metric(predicted, expected)
             writer.add_scalar('validation word_BLEU', word_bleu, global_step)
             
-            # use character-level BLEU as the main metric
-            bleu = char_bleu
+            # 使用NLTK的BLEU得分作为主要指标
+            bleu = nltk_bleu if nltk_bleu is not None else char_bleu
         else:
             # non-Chinese language uses standard BLEU
             metric = torchmetrics.BLEUScore()
@@ -227,8 +266,8 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
         
         writer.flush()
     
-    # return all evaluation metrics
-    return bleu, source_texts, expected, predicted, char_bleu, word_bleu, cer, wer
+    # return all evaluation metrics including the new nltk_bleu
+    return bleu, source_texts, expected, predicted, char_bleu, word_bleu, cer, wer, nltk_bleu
 
 def get_all_sentences(ds, lang):
     for item in ds:
@@ -370,12 +409,19 @@ def train_model(config):
 
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id('[PAD]'), label_smoothing=0.1).to(device)
 
+    # 获取梯度累积步数
+    gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
+    print(f"Using gradient accumulation with {gradient_accumulation_steps} steps")
+
     for epoch in range(initial_epoch, config['num_epochs']):
         torch.cuda.empty_cache()
         model.train()
         batch_iterator = tqdm(train_dataloader, desc=f"Processing Epoch {epoch:02d}")
-        for batch in batch_iterator:
-
+        
+        # 用于累积损失显示
+        accumulated_loss = 0
+        
+        for batch_idx, batch in enumerate(batch_iterator):
             encoder_input = batch['encoder_input'].to(device) # (b, seq_len)
             decoder_input = batch['decoder_input'].to(device) # (B, seq_len)
             encoder_mask = batch['encoder_mask'].to(device) # (B, 1, 1, seq_len)
@@ -391,29 +437,41 @@ def train_model(config):
 
             # Compute the loss using a simple cross entropy
             loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
-            batch_iterator.set_postfix({"loss": f"{loss.item():6.3f}"})
+            
+            # 通过梯度累积步数缩放损失
+            loss = loss / gradient_accumulation_steps
+            
+            # 累积损失用于显示
+            accumulated_loss += loss.item()
+            
+            # 显示每个批次的平均损失
+            if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(batch_iterator):
+                batch_iterator.set_postfix({"loss": f"{accumulated_loss:.3f}"})
+                accumulated_loss = 0
 
             # Log the loss
-            writer.add_scalar('train loss', loss.item(), global_step)
+            writer.add_scalar('train loss', loss.item() * gradient_accumulation_steps, global_step)
             writer.flush()
 
             # Backpropagate the loss
             loss.backward()
 
-            # Update the weights
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            # 仅在累积了指定步数的梯度后更新参数
+            if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(batch_iterator):
+                # Update the weights
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            # 更新学习率
-            scheduler.step()
-            # 记录学习率
-            writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], global_step)
-
-            global_step += 1
+                # 更新学习率
+                scheduler.step()
+                # 记录学习率
+                writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], global_step)
+                
+                global_step += 1
 
         # Run validation at the end of every epoch
         print(f"\n▶ Validation after epoch {epoch}")
-        bleu_score, source_texts, target_texts, predicted_texts, char_bleu, word_bleu, cer, wer = run_validation(
+        bleu_score, source_texts, target_texts, predicted_texts, char_bleu, word_bleu, cer, wer, nltk_bleu = run_validation(
             model, 
             val_dataloader,
             tokenizer_src,
@@ -453,18 +511,20 @@ def train_model(config):
                 
                 # if the source or target language is Chinese, add character-level and word-level BLEU
                 if config['lang_src'] == 'zh' or config['lang_tgt'] == 'zh':
+                    if nltk_bleu is not None:
+                        f.write(f"NLTK BLEU (jieba tokenized): {nltk_bleu:.4f}\n")
                     if char_bleu is not None:
                         f.write(f"Character-level BLEU: {char_bleu:.4f}\n")
                     if word_bleu is not None:
                         f.write(f"Word-level BLEU: {word_bleu:.4f}\n")
-                    f.write(f"Main BLEU (Character-level): {bleu_score:.4f}\n")
+                    f.write(f"Main BLEU (NLTK): {bleu_score:.4f}\n")
                 else:
                     f.write(f"BLEU Score: {bleu_score:.4f}\n")
             
             # record BLEU score to log file
             with open(f"{config['datasource']}_{config['model_folder']}/bleu_log.txt", "a", encoding="utf-8") as f:
-                if config['lang_src'] == 'zh' or config['lang_tgt'] == 'zh' and char_bleu is not None and word_bleu is not None:
-                    f.write(f"Epoch: {epoch}, Char-BLEU: {char_bleu:.4f}, Word-BLEU: {word_bleu:.4f}\n")
+                if config['lang_src'] == 'zh' or config['lang_tgt'] == 'zh' and nltk_bleu is not None:
+                    f.write(f"Epoch: {epoch}, NLTK-BLEU: {nltk_bleu:.4f}, Char-BLEU: {char_bleu:.4f}, Word-BLEU: {word_bleu:.4f}\n")
                 else:
                     f.write(f"Epoch: {epoch}, BLEU: {bleu_score:.4f}\n")
     

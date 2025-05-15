@@ -1,0 +1,16 @@
+Example 1:
+Source: 停下来，看一看，向前走
+Target: Stop. Look. Go.
+Predicted: : .
+
+Example 2:
+Source: 首先，那个将被捕食的雄萤火虫说：“你爱我吗？”
+Target: First the prey male flashes, "Do you love me?"
+Predicted: : .
+
+Character Error Rate: 0.9508
+Word Error Rate: 1.0000
+NLTK BLEU (jieba tokenized): 0.0000
+Character-level BLEU: 0.0000
+Word-level BLEU: 0.0000
+Main BLEU (NLTK): 0.0000
