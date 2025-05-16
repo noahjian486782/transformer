@@ -223,7 +223,11 @@ class Transformer(nn.Module):
         # (batch, seq_len, vocab_size)
         return self.projection_layer(x)
     
-def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_len: int, tgt_seq_len: int, d_model: int=512, N: int=6, h: int=8, dropout: float=0.1, d_ff: int=2048) -> Transformer:
+def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_len: int, tgt_seq_len: int, d_model: int=512, N: int=6, h: int=8, dropout: float=0.1, d_ff: int=2048, decoder_layers: int=None) -> Transformer:
+    # 允许解码器层数与编码器层数不同
+    if decoder_layers is None:
+        decoder_layers = N  # 如果未指定，则与编码器层数相同
+    
     # Create the embedding layers
     src_embed = InputEmbeddings(d_model, src_vocab_size)
     tgt_embed = InputEmbeddings(d_model, tgt_vocab_size)
@@ -242,7 +246,7 @@ def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_len: int
 
     # Create the decoder blocks
     decoder_blocks = []
-    for _ in range(N):
+    for _ in range(decoder_layers):
         decoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
         decoder_cross_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
         feed_forward_block = FeedForwardBlock(d_model, d_ff, dropout)

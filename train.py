@@ -16,9 +16,13 @@ from pathlib import Path
 # Huggingface datasets and tokenizers
 from datasets import load_dataset
 from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
+from tokenizers.models import WordLevel, BPE
 from tokenizers.trainers import WordLevelTrainer
 from tokenizers.pre_tokenizers import Whitespace
+
+# SentencePiece相关导入
+from tokenizers import SentencePieceProcessor, pre_tokenizers
+from tokenizers.processors import TemplateProcessing
 
 import torchmetrics
 from torch.utils.tensorboard import SummaryWriter
@@ -275,29 +279,55 @@ def get_all_sentences(ds, lang):
 
 def get_or_build_tokenizer(config, ds, lang):
     tokenizer_path = Path(config['tokenizer_file'].format(lang))
+    
+    # 判断是否需要构建新的分词器
     if not Path.exists(tokenizer_path):
-        # Most code taken from: https://huggingface.co/docs/tokenizers/quicktour
-        tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
+        print(f"Building {lang} tokenizer with SentencePiece...")
         
-        # 针对中文的分词处理    
-        if lang == "zh":
-            # Chinese character-level tokenization, do not use space tokenization
-            from tokenizers.pre_tokenizers import Metaspace
-            # try to use a compatible way to create Metaspace
-            try:
-                tokenizer.pre_tokenizer = Metaspace(replacement="▁", add_prefix_space=True)
-            except TypeError:
-                # if the above call fails, try without the add_prefix_space parameter
-                tokenizer.pre_tokenizer = Metaspace(replacement="▁")
-        else:
-            # other languages use space tokenization
-            tokenizer.pre_tokenizer = Whitespace()
-            
-        trainer = WordLevelTrainer(special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"], min_frequency=2)
-        tokenizer.train_from_iterator(get_all_sentences(ds, lang), trainer=trainer)
+        # 创建临时文件存储语料
+        corpus_file = Path(f"corpus_{lang}.txt")
+        with open(corpus_file, "w", encoding="utf-8") as f:
+            for text in get_all_sentences(ds, lang):
+                f.write(text + "\n")
+        
+        # 使用tokenizers库的SentencePiece功能
+        from tokenizers import SentencePieceUnigramTokenizer
+        
+        # 中文和英文使用不同的词表大小
+        vocab_size = 40000 if lang == "zh" else 32000
+        
+        # 创建并训练SentencePiece分词器
+        tokenizer = SentencePieceUnigramTokenizer()
+        special_tokens = ["[UNK]", "[PAD]", "[SOS]", "[EOS]"]
+        
+        # 训练分词器
+        tokenizer.train(
+            files=[str(corpus_file)],
+            vocab_size=vocab_size,
+            special_tokens=special_tokens,
+            show_progress=True
+        )
+        
+        # 设置后处理器，确保标记化和解标记化工作正常
+        tokenizer.post_processor = TemplateProcessing(
+            single="[SOS] $A [EOS]",
+            special_tokens=[
+                ("[SOS]", tokenizer.token_to_id("[SOS]")),
+                ("[EOS]", tokenizer.token_to_id("[EOS]")),
+            ],
+        )
+        
+        # 保存分词器
         tokenizer.save(str(tokenizer_path))
+        
+        # 清理临时文件
+        corpus_file.unlink()
+        
+        print(f"SentencePiece tokenizer for {lang} built and saved at {tokenizer_path}")
     else:
         tokenizer = Tokenizer.from_file(str(tokenizer_path))
+        print(f"Loaded existing tokenizer for {lang} from {tokenizer_path}")
+        
     return tokenizer
 
 def get_ds(config):
@@ -346,7 +376,19 @@ def get_ds(config):
     return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
 
 def get_model(config, vocab_src_len, vocab_tgt_len):
-    model = build_transformer(vocab_src_len, vocab_tgt_len, config["seq_len"], config['seq_len'], d_model=config['d_model'])
+    # 使用新的配置参数构建模型
+    model = build_transformer(
+        vocab_src_len, 
+        vocab_tgt_len, 
+        config["seq_len"], 
+        config['seq_len'], 
+        d_model=config['d_model'],
+        N=config.get('encoder_layers', 6),       # 使用配置中的编码器层数，默认为6
+        decoder_layers=config.get('decoder_layers', None),  # 使用配置中的解码器层数
+        h=config.get('heads', 8),                # 可以添加头数配置
+        dropout=config.get('dropout', 0.1),      # 可以添加dropout配置
+        d_ff=config.get('d_ff', 2048)            # 可以添加前馈网络维度配置
+    )
     return model
 
 def train_model(config):
@@ -407,7 +449,11 @@ def train_model(config):
     else:
         print('No model to preload, starting from scratch')
 
-    loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id('[PAD]'), label_smoothing=0.1).to(device)
+    # 修改损失函数，使用配置的label_smoothing
+    loss_fn = nn.CrossEntropyLoss(
+        ignore_index=tokenizer_src.token_to_id('[PAD]'), 
+        label_smoothing=config.get('label_smoothing', 0.1)
+    ).to(device)
 
     # 获取梯度累积步数
     gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
